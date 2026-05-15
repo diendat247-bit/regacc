@@ -7,7 +7,7 @@ from threading import Thread
 TOKEN = "8759609630:AAEAJfmIIEZXcIR8OTRj2g_OmxCfxUXPKtc"
 # Biến tạm để lưu Cookie trong lúc chạy
 current_cookie = "CHUA_CO_COOKIE" 
-web_app_url = "LINK_RENDER_CUA_BAN"
+web_app_url = "https://regacc-4uk7.onrender.com"
 
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
