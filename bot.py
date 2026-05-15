@@ -86,7 +86,7 @@ def start(message):
     markup.add(btn)
     bot.send_message(message.chat.id, "Gửi Cookie mới cho mình hoặc bấm nút bên dưới:", reply_markup=markup)
 
-@bot.message_handler(func=lambda m: "SPC_EC=" in m.text)
+@bot.message_handler(func=lambda m: "SPC_F=" in m.text)
 def update_cookie(message):
     global current_cookie
     current_cookie = message.text.strip()
