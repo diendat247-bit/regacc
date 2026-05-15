@@ -29,42 +29,53 @@ def get_shopee_orders(cookie):
 
 @app.route('/')
 def index():
-    return "Bot Shopee đang chạy ổn định!"
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html lang="vi">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Shopee Orders</title>
+        <script src="https://telegram.org/js/telegram-web-app.js"></script>
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f4f4f4; margin: 0; padding: 15px; color: #333; }
+            h2 { text-align: center; color: #ee4d2d; font-size: 20px; }
+            .order-card { background: white; border-radius: 12px; padding: 15px; margin-bottom: 12px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); border-left: 5px solid #ee4d2d; }
+            .status { font-weight: bold; color: #ee4d2d; font-size: 13px; text-transform: uppercase; margin-bottom: 5px; }
+            .product-name { font-size: 15px; line-height: 1.4; margin-bottom: 8px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+            .price { font-weight: bold; color: #333; font-size: 16px; text-align: right; }
+            .loading { text-align: center; margin-top: 50px; color: #888; }
+        </style>
+    </head>
+    <body>
+        <h2>Đơn Hàng Của Bạn</h2>
+        <div id="order-list"><div class="loading">Đang lấy dữ liệu từ Shopee...</div></div>
 
-@app.route('/api/orders')
-def api_orders():
-    orders = get_shopee_orders(current_cookie)
-    result = []
-    for o in orders:
-        try:
-            status = o['status_info']['status_label']['text']
-            product = o['info_card']['order_list_cards'][0]['product_info']['item_groups'][0]['items'][0]['name']
-            price = o['info_card']['final_total'] / 100000
-            result.append({"status": status, "name": product, "price": price})
-        except:
-            continue
-    return jsonify(result)
-
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    markup = telebot.types.InlineKeyboardMarkup()
-    btn = telebot.types.InlineKeyboardButton("Mở Mini App 📦", web_app=telebot.types.WebAppInfo(url=WEB_APP_URL))
-    markup.add(btn)
-    text = "Chào mừng bạn! Hãy dán Cookie Shopee (có chứa SPC_F) vào đây để mình kiểm tra đơn hàng giúp bạn nhé."
-    bot.send_message(message.chat.id, text, reply_markup=markup)
-
-@bot.message_handler(func=lambda m: "SPC_F=" in m.text)
-def handle_cookie(message):
-    global current_cookie
-    current_cookie = message.text.strip()
-    bot.reply_to(message, "✅ Đã nhận Cookie thành công! Bây giờ bạn hãy bấm nút 'Mở Mini App' ở trên để xem danh sách đơn hàng.")
-
-def run_flask():
-    app.run(host='0.0.0.0', port=8080)
-
-if __name__ == "__main__":
-    print("Bot đang khởi động...")
-    # Chạy Flask ở một luồng riêng
-    Thread(target=run_flask).start()
-    # Chạy Bot Telegram
-    bot.infinity_polling()
+        <script>
+            fetch('/api/orders')
+                .then(response => response.json())
+                .then(data => {
+                    const list = document.getElementById('order-list');
+                    if (data.length === 0) {
+                        list.innerHTML = '<div class="loading">Không tìm thấy đơn hàng hoặc Cookie hết hạn.</div>';
+                        return;
+                    }
+                    list.innerHTML = '';
+                    data.forEach(order => {
+                        const card = `
+                            <div class="order-card">
+                                <div class="status">${order.status}</div>
+                                <div class="product-name">${order.name}</div>
+                                <div class="price">₫${order.price.toLocaleString('vi-VN')}</div>
+                            </div>
+                        `;
+                        list.innerHTML += card;
+                    });
+                })
+                .catch(err => {
+                    document.getElementById('order-list').innerHTML = '<div class="loading">Lỗi kết nối Server!</div>';
+                });
+        </script>
+    </body>
+    </html>
+    """)
