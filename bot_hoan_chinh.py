@@ -12,8 +12,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 load_dotenv()
 
 # ================= CẤU HÌNH TỪ BIẾN MÔI TRƯỜNG =================
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-VIOTP_TOKEN = os.environ.get("VIOTP_TOKEN")
+TELEGRAM_TOKEN = os.environ.get("8792394937:AAHHROhBsoa0GvYzDfNuNufOC_VWhH1QTp8")
+VIOTP_TOKEN = os.environ.get("19ff88d563be40ebac2c3103cdf80c2c")
 
 # Lấy danh sách ADMIN_IDS (Hỗ trợ ngăn cách bằng dấu phẩy)
 raw_admins = os.environ.get("ADMIN_IDS", os.environ.get("ADMIN_ID", "0"))
