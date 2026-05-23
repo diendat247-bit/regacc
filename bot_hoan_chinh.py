@@ -1,396 +1,432 @@
 import os
-import sys
-import json
 import asyncio
-import logging
-import sqlite3
-import aiohttp
-from aiogram import Bot, Dispatcher, executor, types
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
-from playwright.async_api import async_playwright
+import threading
+import http.server
+import socketserver
+import requests
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-# Config logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+load_dotenv()
 
-# --- CONFIGURATION (Thay thế bằng thông tin của bạn) ---
-API_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN' # Điền Token Bot của bạn vào đây
-VIOTP_TOKEN = 'YOUR_VIOTP_TOKEN'       # Điền Token ViOTP của bạn vào đây
-VIOTP_SERVICE_ID = '245'               # ID Dịch vụ Shopee trên ViOTP (Ví dụ: 245)
+# ================= CẤU HÌNH TỪ BIẾN MÔI TRƯỜNG =================
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+VIOTP_TOKEN = os.environ.get("VIOTP_TOKEN")
 
-# Khởi tạo Bot và Dispatcher
-storage = MemoryStorage()
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot, storage=storage)
+# Lấy danh sách ADMIN_IDS (Hỗ trợ ngăn cách bằng dấu phẩy)
+raw_admins = os.environ.get("ADMIN_IDS", os.environ.get("ADMIN_ID", "0"))
+try:
+    ADMIN_IDS = [int(x.strip()) for x in raw_admins.split(",") if x.strip().isdigit()]
+except Exception:
+    ADMIN_IDS = []
 
-# --- DATABASE SETUP (SQLite) ---
-DB_FILE = "database.db"
+BASE_URL = "https://api.viotp.com"
 
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS accounts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone TEXT,
-            password TEXT,
-            cookies TEXT,
-            spc_f TEXT,
-            spc_t TEXT,
-            status TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# ================= KHO DỮ LIỆU LỊCH SỬ TOÀN CỤC =================
+GLOBAL_HISTORY = {}
 
-init_db()
+# ================= WEB SERVER ẢO CHO RENDER =================
+PORT = int(os.environ.get("PORT", 10000))
 
-# --- STATE MANAGEMENT (FSM) ---
-class BotStates(StatesGroup):
-    waiting_for_proxy = State()
-    waiting_for_viotp_key = State()
+class DummyHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"<h1>Bot Telegram ViOTP dang hoat dong tot!</h1>")
 
-# Quản lý các phiên giải captcha đang hoạt động giữa Playwright và Telegram
-class CaptchaManager:
-    def __init__(self):
-        self.sessions = {}
+def run_web():
+    try:
+        socketserver.TCPServer.allow_reuse_address = True 
+        with socketserver.TCPServer(("0.0.0.0", PORT), DummyHandler) as httpd:
+            print(f"🌐 Web Server da mo cong {PORT} cho Render...")
+            httpd.serve_forever()
+    except Exception as e:
+        print(f"Lỗi Web Server: {e}")
 
-    def create_session(self, user_id):
-        self.sessions[user_id] = {
-            'event': asyncio.Event(),
-            'action': None,
-            'value': 0,
-            'offset_x': 0,
-            'is_active': True
-        }
-        return self.sessions[user_id]
+# ================= CÁC HÀM TIỆN ÍCH =================
 
-    def get_session(self, user_id):
-        return self.sessions.get(user_id)
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
 
-    def close_session(self, user_id):
-        if user_id in self.sessions:
-            self.sessions[user_id]['is_active'] = False
-            self.sessions[user_id]['event'].set()
-            del self.sessions[user_id]
+def format_money(amount):
+    try:
+        return f"{int(amount):,}".replace(",", ".") + "đ"
+    except (ValueError, TypeError):
+        return f"{amount}đ"
 
-captcha_manager = CaptchaManager()
+# --- CÁC HÀM GỌI API VIOTP ---
+def api_get(endpoint, params=None):
+    if params is None:
+        params = {}
+    params['token'] = VIOTP_TOKEN
+    try:
+        return requests.get(f"{BASE_URL}{endpoint}", params=params, timeout=10).json()
+    except Exception as e:
+        return {"status_code": -1, "message": str(e)}
 
-# --- KEYBOARDS ---
-def main_keyboard():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("🚀 Reg Account", callback_data="menu_reg"),
-        types.InlineKeyboardButton("🌐 Cài Đặt Proxy", callback_data="menu_proxy"),
-        types.InlineKeyboardButton("📊 Check Acc Đã Reg", callback_data="menu_check")
-    )
-    return kb
+def get_balance(): return api_get("/users/balance")
+def get_networks(): return api_get("/networks/get")
+def get_services(): return api_get("/service/getv2", {"country": "vn"})
+def request_number(service_id): return api_get("/request/getv2", {"serviceId": service_id})
+def check_otp(request_id): return api_get("/session/getv2", {"requestId": request_id})
 
-def captcha_keyboard(offset):
-    kb = types.InlineKeyboardMarkup(row_width=4)
-    kb.add(
-        types.InlineKeyboardButton("⏪ -30px", callback_data="cap_-30"),
-        types.InlineKeyboardButton("⬅️ -5px", callback_data="cap_-5"),
-        types.InlineKeyboardButton("➡️ +5px", callback_data="cap_5"),
-        types.InlineKeyboardButton("⏩ +30px", callback_data="cap_30")
-    )
-    kb.add(
-        types.InlineKeyboardButton("⏪ -2px", callback_data="cap_-2"),
-        types.InlineKeyboardButton("⬅️ -1px", callback_data="cap_-1"),
-        types.InlineKeyboardButton("➡️ +1px", callback_data="cap_1"),
-        types.InlineKeyboardButton("⏩ +2px", callback_data="cap_2")
-    )
-    kb.add(types.InlineKeyboardButton(f"🎯 Xác Nhận Thả (Offset: {offset}px)", callback_data="cap_submit"))
-    return kb
-
-# --- TELEGRAM HANDLERS ---
-@dp.message_handler(commands=['start', 'help'])
-async def cmd_start(message: types.Message):
-    await message.answer("🤖 CHÀO MỪNG BẠN ĐẾN VỚI BOT REG ACCOUNT AUTOMATION!\n\nVui lòng chọn chức năng dưới thanh điều hướng:", reply_markup=main_keyboard())
-
-@dp.callback_query_handler(lambda c: c.data == "menu_proxy")
-async def callback_proxy(call: types.CallbackQuery):
-    await BotStates.waiting_for_proxy.set()
-    await call.message.answer("🌐 Vui lòng gửi Proxy theo định dạng chuẩn:\n`IP:PORT` hoặc `IP:PORT:USER:PASS`\n\n*(Gửi /cancel nếu muốn hủy bỏ)*", parse_mode="Markdown")
-    await call.answer()
-
-@dp.message_handler(state="*", commands=['cancel'])
-async def cmd_cancel(message: types.Message, state: FSMContext):
-    await state.finish()
-    await message.answer("❌ Đã hủy thao tác hiện tại.", reply_markup=main_keyboard())
-
-@dp.message_handler(state=BotStates.waiting_for_proxy)
-async def process_proxy_input(message: types.Message, state: FSMContext):
-    proxy_str = message.text.strip()
-    # Kiểm tra cơ bản cấu trúc định dạng
-    parts = proxy_str.split(':')
-    if len(parts) in [2, 4]:
-        await state.update_data(proxy=proxy_str)
-        await message.answer(f"✅ Đã lưu Proxy thành công:\n`{proxy_str}`", parse_mode="Markdown", reply_markup=main_keyboard())
-        await state.reset_state(with_data=False)
-    else:
-        await message.answer("⚠️ Định dạng proxy không hợp lệ. Vui lòng nhập lại (IP:PORT hoặc IP:PORT:USER:PASS):")
-
-@dp.callback_query_handler(lambda c: c.data == "menu_check")
-async def callback_check_accounts(call: types.CallbackQuery):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, phone, status, created_at FROM accounts ORDER BY id DESC LIMIT 10")
-    rows = cursor.fetchall()
-    conn.close()
-    
-    if not rows:
-        await call.message.answer("📊 Hiện tại chưa có tài khoản nào được đăng ký trong hệ thống.")
-    else:
-        msg = "📊 **DANH SÁCH 10 TÀI KHOẢN REG GẦN NHẤT:**\n\n"
-        for row in rows:
-            msg += f"🆔 ID: {row[0]} | 📱 SĐT: `{row[1]}` | 📌 STT: {row[2]} | 📅 {row[3]}\n"
-        await call.message.answer(msg, parse_mode="Markdown")
-    await call.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "menu_reg")
-async def callback_start_reg(call: types.CallbackQuery, state: FSMContext):
-    user_data = await state.get_data()
-    proxy = user_data.get('proxy')
-    
-    if not proxy:
-        await call.message.answer("❌ Bạn chưa cài đặt Proxy! Vui lòng chọn 'Cài Đặt Proxy' trước khi tiến hành Reg.", reply_markup=main_keyboard())
-        await call.answer()
-        return
-
-    await call.message.answer("⏳ Đang tiến hành lấy số điện thoại từ ViOTP và khởi chạy trình duyệt ngầm...")
-    await call.answer()
-    
-    # Chạy tác vụ Reg Account trong nền (không làm nghẽn Bot)
-    asyncio.create_task(run_registration_flow(call.from_user.id, proxy))
-
-# Xử lý điều hướng giải Captcha trực tiếp từ phím nhấn Telegram
-@dp.callback_query_handler(lambda c: c.data.startswith("cap_"))
-async def handle_captcha_navigation(call: types.CallbackQuery):
-    user_id = call.from_user.id
-    session = captcha_manager.get_session(user_id)
-    
-    if not session or not session['is_active']:
-        await call.answer("⚠️ Phiên giải Captcha này đã kết thúc hoặc không tồn tại.", show_alert=True)
-        return
-        
-    action_data = call.data.split('_')[1]
-    
-    if action_data == 'submit':
-        session['action'] = 'submit'
-        session['event'].set()
-        await call.answer("🚀 Đang gửi lệnh thả mảnh ghép...")
-    else:
-        move_val = int(action_data)
-        session['action'] = 'move'
-        session['value'] = move_val
-        session['offset_x'] += move_val
-        session['event'].set()
-        await call.answer(f"Kéo sang {'phải' if move_val > 0 else 'trái'} {abs(move_val)}px")
-
-# --- CORE AUTOMATION FLOW (PLAYWRIGHT + VIOTP) ---
-async def fetch_phone_viotp():
-    url = f"https://api.viotp.com/request/getv2?token={VIOTP_TOKEN}&serviceId={VIOTP_SERVICE_ID}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            res_json = await response.json()
-            if res_json.get('status_code') == 200:
-                return res_json['data']['phone_number'], res_json['data']['request_id']
-            return None, res_json.get('message', 'Lỗi không xác định')
-
-async def fetch_otp_viotp(request_id):
-    url = f"https://api.viotp.com/request/getotp?token={VIOTP_TOKEN}&requestId={request_id}"
-    async with aiohttp.ClientSession() as session:
-        # Polling lấy OTP trong vòng 60 giây
-        for _ in range(12):
-            await asyncio.sleep(5)
-            async with session.get(url) as response:
-                res_json = await response.json()
-                if res_json.get('status_code') == 200:
-                    status = res_json['data']['Status']
-                    if status == 1: # Đã có OTP
-                        return res_json['data']['Code']
-    return None
-
-async def run_registration_flow(user_id, proxy_str):
-    # 1. Thuê số điện thoại
-    phone, req_id_or_err = await fetch_phone_viotp()
-    if not phone:
-        await bot.send_message(user_id, f"❌ Không thể thuê số điện thoại từ ViOTP. Lý do: {req_id_or_err}")
-        return
-        
-    await bot.send_message(user_id, f"📱 Đã thuê được SĐT: `{phone}`\nĐang tiến hành mở trang đăng ký...", parse_mode="Markdown")
-    
-    # Cấu hình proxy cho Playwright
-    proxy_parts = proxy_str.split(':')
-    proxy_config = {"server": f"http://{proxy_parts[0]}:{proxy_parts[1]}"}
-    if len(proxy_parts) == 4:
-        proxy_config["username"] = proxy_parts[2]
-        proxy_config["password"] = proxy_parts[3]
-
-    async with async_playwright() as p:
-        # Khởi chạy Chromium ở chế độ Headless=True vì chạy trên Render không có màn hình
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            proxy=proxy_config,
-            viewport={'width': 375, 'height': 812}, # Giả lập giao diện Mobile để dễ bắt gói và giải Captcha mảnh ghép
-            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1"
-        )
-        page = await context.new_page()
-        
+# --- HÀM GỬI THÔNG BÁO CHO TOÀN BỘ ADMIN ---
+async def broadcast_to_admins(context: ContextTypes.DEFAULT_TYPE, text: str, voice_url: str = None, phone: str = ""):
+    for admin_id in ADMIN_IDS:
         try:
-            # Truy cập trang Đăng ký tài khoản (Ví dụ mẫu: trang đăng ký Shopee Mobile)
-            await page.goto("https://shopee.vn/buyer/signup?next=https%3A%2F%2Fshopee.vn%2F")
-            await page.wait_for_timeout(3000)
-            
-            # Điền số điện thoại vào input field (Cần thay đổi Selector phù hợp với cấu trúc thực tế của web)
-            # Selector dưới đây mang tính chất minh họa chuẩn cấu trúc form phổ biến
-            phone_input = await page.query_selector("input[type='tel']")
-            if phone_input:
-                await phone_input.fill(phone)
-                await page.wait_for_timeout(1000)
-                # Bấm nút Tiếp Tục / Đăng Ký
-                btn_next = await page.query_selector("button:has-text('Tiếp theo'), button:has-text('Đăng ký')")
-                if btn_next:
-                    await btn_next.click()
-            
-            await page.wait_for_timeout(4000)
-            
-            # --- KIỂM TRA VÀ XỬ LÝ CAPTCHA MẢNH GHÉP (SLIDER CAPTCHA) ---
-            # Tìm Selector của khung chứa Captcha và nút gạt slider
-            captcha_box = await page.query_selector(".shopee-captcha-box, .grecaptcha-badge, div[class*='captcha']")
-            slider_handle = await page.query_selector(".shopee-slider__handle, div[class*='slider-handle'], div[class*='btn_slide']")
-            
-            if slider_handle:
-                await bot.send_message(user_id, "🧩 Phát hiện Captcha mảnh ghép! Đang thiết lập thanh điều hướng giải tay...")
-                
-                # Lấy tọa độ ban đầu của thanh trượt để di chuyển chuột
-                box = await slider_handle.bounding_box()
-                start_x = box['x'] + box['width'] / 2
-                start_y = box['y'] + box['height'] / 2
-                
-                # Di chuyển chuột tới vị trí nút gạt và nhấn giữ xuống
-                await page.mouse.move(start_x, start_y)
-                await page.mouse.down()
-                
-                # Khởi tạo phiên tương tác giải captcha trên bot Telegram
-                session = captcha_manager.create_session(user_id)
-                msg_captcha = None
-                
-                while session['is_active']:
-                    # Chụp hình vùng chứa captcha (Hoặc chụp toàn màn hình thiết bị nếu không định vị được element)
-                    captcha_img_path = f"captcha_{user_id}.png"
-                    if captcha_box:
-                        await captcha_box.screenshot(path=captcha_img_path)
-                    else:
-                        await page.screenshot(path=captcha_img_path)
-                        
-                    # Gửi hoặc cập nhật ảnh lên khung chat Telegram
-                    with open(captcha_img_path, "rb") as photo:
-                        if msg_captcha is None:
-                            msg_captcha = await bot.send_photo(
-                                user_id, 
-                                photo=photo, 
-                                caption=f"🔄 Dùng các nút dưới đây để căn chỉnh mảnh ghép vào ô trống thích hợp:", 
-                                reply_markup=captcha_keyboard(session['offset_x'])
-                            )
-                        else:
-                            # Cập nhật ảnh mới và thanh điều hướng sau mỗi lượt dịch chuyển pixel
-                            media = types.InputMediaPhoto(photo, caption=f"🔄 Dùng các nút dưới đây để căn chỉnh mảnh ghép vào ô trống thích hợp:")
-                            await msg_captcha.edit_media(media=media, reply_markup=captcha_keyboard(session['offset_x']))
-                    
-                    # Xóa file ảnh tạm
-                    if os.path.exists(captcha_img_path):
-                        os.remove(captcha_img_path)
-                        
-                    # Chờ người dùng nhấn nút trên Telegram điều khiển
-                    await session['event'].wait()
-                    session['event'].clear()
-                    
-                    if session['action'] == 'move':
-                        # Di chuyển chuột theo tọa độ offset lũy kế mới
-                        await page.mouse.move(start_x + session['offset_x'], start_y)
-                        await page.wait_for_timeout(300) # Đợi trình duyệt cập nhật hình ảnh mảnh ghép dịch chuyển
-                    elif session['action'] == 'submit':
-                        # Nhả chuột ra để xác nhận vị trí mảnh ghép đã khớp
-                        await page.mouse.up()
-                        captcha_manager.close_session(user_id)
-                        await bot.send_message(user_id, "🎯 Đã thả mảnh ghép! Đang kiểm tra kết quả xác thực...")
-                        break
-            
-            await page.wait_for_timeout(4000)
-            
-            # --- CHỜ VÀ ĐIỀN MÃ OTP TỪ VIOTP ---
-            await bot.send_message(user_id, "⏳ Đang lắng nghe hệ thống lấy mã OTP gửi về số điện thoại...")
-            otp_code = await fetch_otp_viotp(req_id_or_err)
-            
-            if not otp_code:
-                await bot.send_message(user_id, "❌ Quá thời gian chờ OTP từ nhà mạng hệ thống ViOTP.")
-                return
-                
-            await bot.send_message(user_id, f"🔑 Đã lấy được mã OTP: `{otp_code}`. Tiến hành điền mã...")
-            
-            # Điền OTP vào ô nhận dạng trên trình duyệt
-            otp_input = await page.query_selector("input[type='password'], input[placeholder*='OTP'], input[class*='otp']")
-            if otp_input:
-                await otp_input.fill(otp_code)
-                await page.wait_for_timeout(1000)
-                btn_submit_otp = await page.query_selector("button[type='submit'], button:has-text('Xác nhận')")
-                if btn_submit_otp:
-                    await btn_submit_otp.click()
-            
-            await page.wait_for_timeout(5000)
-            
-            # --- LẤY COOKIE VÀ THÔNG TIN TÀI KHOẢN (SPC_F, SPC_T) ---
-            cookies = await context.cookies()
-            cookies_json = json.dumps(cookies)
-            
-            spc_f = next((c['value'] for c in cookies if c['name'] == 'SPC_F'), "Không tìm thấy")
-            spc_t = next((c['value'] for c in cookies if c['name'] == 'SPC_T'), "Không tìm thấy")
-            
-            # Lưu tài khoản thành công vào Database SQLite
-            password_default = "AccShop2026@" # Mật khẩu mặc định tự tạo cho acc mới
-            conn = sqlite3.connect(DB_FILE)
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO accounts (phone, password, cookies, spc_f, spc_t, status) VALUES (?, ?, ?, ?, ?, ?)",
-                (phone, password_default, cookies_json, spc_f, spc_t, "Thành Công")
-            )
-            conn.commit()
-            conn.close()
-            
-            # Xuất kết quả toàn diện ra màn hình Telegram chat
-            success_msg = f"🎉 **REG TÀI KHOẢN THÀNH CÔNG!**\n\n" \
-                          f"📱 SĐT: `{phone}`\n" \
-                          f"🔑 MK: `{password_default}`\n" \
-                          f"🌐 SPC_F: `{spc_f}`\n" \
-                          f"🌐 SPC_T: `{spc_t}`\n\n" \
-                          f"📦 Dữ liệu Cookie đầy đủ đã được lưu trữ an toàn trong DB."
-            await bot.send_message(user_id, success_msg, parse_mode="Markdown", reply_markup=main_keyboard())
-            
+            await context.bot.send_message(chat_id=admin_id, text=text, parse_mode='HTML')
+            if voice_url and "http" in str(voice_url):
+                try:
+                    await context.bot.send_voice(chat_id=admin_id, voice=voice_url, caption=f"🎧 File Voice OTP của số {phone}")
+                except Exception:
+                    await context.bot.send_message(chat_id=admin_id, text=f"🔗 Link Audio OTP: {voice_url}")
         except Exception as e:
-            logging.error(f"Lỗi trong quá trình Reg: {str(e)}")
-            await bot.send_message(user_id, f"❌ Quá trình Reg thất bại do xuất hiện lỗi: {str(e)}", reply_markup=main_keyboard())
-        finally:
-            captcha_manager.close_session(user_id)
-            await browser.close()
+            print(f"⚠️ Không thể gửi thông báo tới Admin ID {admin_id}: {e}")
 
-# --- WEB SERVER BINDING FOR RENDER ---
-# Render yêu cầu một Port dịch vụ mở lắng nghe nếu cấu hình Web Service để không bị báo lỗi Deploy Failed.
-# Nếu bạn tạo ứng dụng dạng Background Worker thì phần web server này không bắt buộc nhưng vẫn nên giữ để linh hoạt.
-async def dummy_web_server():
-    from aiohttp import web
-    app = web.Application()
-    app.router.add_get('/', lambda r: web.Response(text="Bot is running completely on Render!"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get('PORT', 8080)))
-    await site.start()
+# ================= HỆ THỐNG LỌC SỐ & REG ACC =================
 
-if __name__ == '__main__':
-    # Khởi chạy dummy web server song song cùng telegram bot polling
-    loop = asyncio.get_event_loop()
-    loop.create_task(dummy_web_server())
-    executor.start_polling(dp, skip_updates=True)
+# --- 1. HÀM KIỂM TRA SỐ SẠCH/BẨN ---
+async def check_number_status(phone: str, service_name: str) -> bool:
+    """
+    Trả về True nếu số ĐÃ BỊ LIÊN KẾT (Cần bỏ qua).
+    Trả về False nếu số SẠCH (Có thể dùng tạo tài khoản).
+    """
+    print(f"🔎 Đang kiểm tra trạng thái của số {phone} cho {service_name}...")
+    
+    # [!] DÁN CODE KIỂM TRA (REQUEST/PLAYWRIGHT) CỦA BẠN VÀO ĐÂY [!]
+    # ... logic check api shopee/facebook ...
+    await asyncio.sleep(1) # Giả lập thời gian check
+    
+    return False # Đổi thành kết quả thực tế từ code của bạn
+
+# --- 2. VÒNG LẶP LỌC SỐ TỰ ĐỘNG ---
+async def auto_filter_and_register(service_id, service_name, raw_price, formatted_price, user_id, context, msg_context):
+    max_retries = 10 # Giới hạn số lần thử tìm số sạch
+    
+    for attempt in range(1, max_retries + 1):
+        await msg_context.edit_text(f"🔄 <b>Lần thử {attempt}/{max_retries}:</b> Đang yêu cầu số từ ViOTP...", parse_mode='HTML')
+        
+        # Bước 1: Gọi API thuê số
+        res = await asyncio.to_thread(request_number, service_id)
+        
+        if str(res.get("status_code")) == "200":
+            phone = res["data"].get("phone_number")
+            req_id = res["data"].get("request_id")
+            current_balance = format_money(res["data"].get("balance", 0))
+            
+            await msg_context.edit_text(f"🔄 <b>Lần thử {attempt}/{max_retries}:</b>\n📞 Lấy được số <code>{phone}</code>.\n🔎 Đang kiểm tra liên kết...", parse_mode='HTML')
+            
+            # Bước 2: Kiểm tra số xem có sạch không
+            is_linked = await check_number_status(phone, service_name)
+            
+            if is_linked:
+                # Nếu đã liên kết -> BỎ QUA VÀ TÌM SỐ MỚI
+                await msg_context.edit_text(f"⚠️ Số <code>{phone}</code> đã dính tài khoản. Đang bỏ qua và lấy số mới...", parse_mode='HTML')
+                await asyncio.sleep(3) # Nghỉ 3s tránh spam API ViOTP
+                continue
+                
+            else:
+                # Nếu số sạch -> LƯU VÀO HISTORY VÀ CANH MÃ
+                vn_time = datetime.utcnow() + timedelta(hours=7)
+                GLOBAL_HISTORY[str(req_id)] = {
+                    "ID": req_id,
+                    "ServiceID": service_id,
+                    "ServiceName": service_name,
+                    "Status": 0,
+                    "Price": raw_price,
+                    "Phone": phone,
+                    "CreatedTime": vn_time.strftime('%Y-%m-%dT%H:%M:%S'),
+                    "Code": ""
+                }
+                
+                success_msg = (
+                    f"✅ <b>TÌM THẤY SỐ SẠCH & BẮT ĐẦU CANH MÃ!</b>\n\n"
+                    f"🏢 Dịch vụ: <b>{service_name}</b>\n"
+                    f"📞 SĐT: <code>{phone}</code>\n"
+                    f"💵 Giá thuê: <b>{formatted_price}</b>\n"
+                    f"💰 Số dư tạm tính: <b>{current_balance}</b>\n"
+                    f"🆔 Request ID: <code>{req_id}</code>\n\n"
+                    f"🚀 <i>Hệ thống đang chạy ngầm Canh OTP & Reg Acc...</i>"
+                )
+                await msg_context.edit_text(success_msg, parse_mode='HTML')
+                
+                # Bắt đầu luồng canh OTP
+                asyncio.create_task(monitor_otp(req_id, phone, service_name, formatted_price, context))
+                
+                # [!] BẠN CÓ THỂ ĐẶT HÀM ĐĂNG KÝ TÀI KHOẢN (REG ACC) VÀO ĐÂY [!]
+                # asyncio.create_task(run_registration_logic(phone, ...))
+                
+                return # Hoàn tất việc lấy số
+                
+        else:
+            # Lỗi API ViOTP (hết số, lỗi server...)
+            await msg_context.edit_text(f"❌ Lỗi ViOTP: {res.get('message')}. Đang thử lại sau 5 giây...")
+            await asyncio.sleep(5)
+            
+    # Nếu vòng lặp chạy hết mà không tìm được số sạch
+    await msg_context.edit_text(f"❌ <b>Thất bại:</b> Đã thử lọc {max_retries} số nhưng đều bị liên kết hoặc ViOTP báo lỗi. Vui lòng thử lại sau.", parse_mode='HTML')
+
+
+# ================= CÁC TIẾN TRÌNH VÀ HANDLERS CŨ =================
+
+# --- TIẾN TRÌNH NGẦM QUÉT LỊCH SỬ TOÀN BỘ DỊCH VỤ ---
+async def background_history_scanner():
+    print("🔄 Bắt đầu tiến trình ngầm đồng bộ lịch sử toàn bộ dịch vụ...")
+    while True:
+        try:
+            vn_time = datetime.utcnow() + timedelta(hours=7)
+            today_str = vn_time.strftime('%Y-%m-%d')
+            
+            services_res = await asyncio.to_thread(get_services)
+            if str(services_res.get("status_code")) == "200":
+                services = services_res.get("data", [])
+                
+                for s in services:
+                    service_id = s["id"]
+                    
+                    for stt in [1, 0]:
+                        params = {
+                            "service": service_id,
+                            "status": stt,
+                            "limit": 100,
+                            "fromDate": today_str,
+                            "toDate": today_str
+                        }
+                        res = await asyncio.to_thread(api_get, "/session/historyv2", params)
+                        
+                        if str(res.get("status_code")) == "200" and res.get("data"):
+                            for item in res["data"]:
+                                item_id = str(item.get("ID"))
+                                GLOBAL_HISTORY[item_id] = item
+                                
+                        await asyncio.sleep(0.3)
+        except Exception as e:
+            print(f"Lỗi quét ngầm: {e}")
+        
+        await asyncio.sleep(300)
+
+async def post_init(application: Application):
+    asyncio.create_task(background_history_scanner())
+
+# --- GIAO DIỆN BÀN PHÍM CHÍNH ---
+def main_reply_keyboard():
+    keyboard = [
+        [KeyboardButton("💰 Tra cứu số dư"), KeyboardButton("🛒 Thuê số OTP")],
+        [KeyboardButton("🏢 Danh sách nhà mạng"), KeyboardButton("🕒 Lịch sử thuê số")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, is_persistent=True)
+
+# --- TIẾN TRÌNH CHẠY NGẦM ĐỂ CANH OTP ---
+async def monitor_otp(req_id, phone, service_name, price, context: ContextTypes.DEFAULT_TYPE):
+    item_id = str(req_id)
+    for _ in range(240): 
+        await asyncio.sleep(5)
+        check_res = await asyncio.to_thread(check_otp, req_id)
+        
+        if str(check_res.get("status_code")) == "200":
+            status = check_res["data"].get("Status")
+            
+            if status == 1:
+                code = check_res["data"].get("Code", "Không rõ")
+                sms = check_res["data"].get("SmsContent", "")
+                
+                if item_id in GLOBAL_HISTORY:
+                    GLOBAL_HISTORY[item_id]["Status"] = 1
+                    GLOBAL_HISTORY[item_id]["Code"] = code
+                
+                balance_res = await asyncio.to_thread(get_balance)
+                current_balance = format_money(balance_res['data']['balance']) if str(balance_res.get("status_code")) == "200" else "Không rõ"
+                
+                is_sound_raw = check_res["data"].get("IsSound", False)
+                is_sound = str(is_sound_raw).lower() == "true"
+                
+                text = (
+                    f"🎉 <b>CÓ MÃ MỚI TỪ VIOTP!</b>\n\n"
+                    f"🏢 Dịch vụ: <b>{service_name}</b>\n"
+                    f"📞 Số: <code>{phone}</code>\n"
+                    f"🔑 Mã Code: <code>{code}</code>\n"
+                    f"💵 Giá thuê: <b>{price}</b>\n"
+                    f"💰 Số dư còn lại: <b>{current_balance}</b>\n"
+                )
+                
+                if not is_sound:
+                    text += f"📝 SMS: <code>{sms}</code>"
+                
+                await broadcast_to_admins(context, text, voice_url=(sms if is_sound else None), phone=phone)
+                return 
+            
+            elif status == 2:
+                if item_id in GLOBAL_HISTORY:
+                    GLOBAL_HISTORY[item_id]["Status"] = 2
+                
+                balance_res = await asyncio.to_thread(get_balance)
+                current_balance = format_money(balance_res['data']['balance']) if str(balance_res.get("status_code")) == "200" else "Không rõ"
+                
+                msg = (
+                    f"❌ <b>SỐ ĐÃ HẾT HẠN (TIMEOUT)</b>\n\n"
+                    f"🏢 Dịch vụ: <b>{service_name}</b>\n"
+                    f"📞 Số: <code>{phone}</code>\n"
+                    f"♻️ Tiền đã được hoàn lại vào tài khoản.\n"
+                    f"💰 Số dư hiện tại: <b>{current_balance}</b>"
+                )
+                await broadcast_to_admins(context, msg)
+                return
+
+    if item_id in GLOBAL_HISTORY:
+        GLOBAL_HISTORY[item_id]["Status"] = 2
+        
+    balance_res = await asyncio.to_thread(get_balance)
+    current_balance = format_money(balance_res['data']['balance']) if str(balance_res.get("status_code")) == "200" else "Không rõ"
+    msg = (
+        f"⚠️ <b>QUÁ THỜI GIAN THEO DÕI (20 Phút)</b>\n\n"
+        f"🏢 Dịch vụ: <b>{service_name}</b>\n"
+        f"📞 Số: <code>{phone}</code>\n"
+        f"Trạng thái: Tự động ngừng theo dõi để giải phóng bộ nhớ.\n"
+        f"💰 Số dư hiện hành: <b>{current_balance}</b>"
+    )
+    await broadcast_to_admins(context, msg)
+
+# --- XỬ LÝ LỆNH /START ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ Bạn không có quyền sử dụng bot này.")
+        return
+
+    text = "🤖 <b>HỆ THỐNG BOT VIOTP ĐÃ SẴN SÀNG</b>\nBàn phím điều khiển đã được mở bên dưới 👇"
+    await update.message.reply_text(text, reply_markup=main_reply_keyboard(), parse_mode='HTML')
+
+# --- XỬ LÝ KHI BẤM NÚT Ở BÀN PHÍM DƯỚI ĐÁY ---
+async def handle_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+
+    text = update.message.text
+
+    if text == "💰 Tra cứu số dư":
+        res = await asyncio.to_thread(get_balance)
+        msg = f"💰 <b>Số dư hiện tại:</b> <code>{format_money(res['data']['balance'])}</code>" if str(res.get("status_code")) == "200" else f"❌ Lỗi: {res.get('message')}"
+        await update.message.reply_text(msg, parse_mode='HTML')
+
+    elif text == "🏢 Danh sách nhà mạng":
+        res = await asyncio.to_thread(get_networks)
+        if str(res.get("status_code")) == "200":
+            msg = "🏢 <b>Danh sách nhà mạng hỗ trợ:</b>\n\n" + "\n".join([f"- {net['name']} (ID: {net['id']})" for net in res["data"]])
+        else:
+            msg = f"❌ Lỗi: {res.get('message')}"
+        await update.message.reply_text(msg, parse_mode='HTML')
+
+    elif text == "🕒 Lịch sử thuê số":
+        vn_time = datetime.utcnow() + timedelta(hours=7)
+        today_str = vn_time.strftime('%Y-%m-%d')
+        
+        today_items = []
+        for item in GLOBAL_HISTORY.values():
+            created_time = item.get("CreatedTime", "")
+            if today_str in created_time:
+                today_items.append(item)
+                
+        if not today_items:
+            await update.message.reply_text(f"🕒 <b>Lịch sử trống</b>\nChưa có giao dịch nào trong ngày hôm nay ({today_str}).", parse_mode='HTML')
+            return
+            
+        try:
+            today_items.sort(key=lambda x: x.get('CreatedTime', ''), reverse=True)
+        except Exception:
+            pass
+            
+        msg = f"🕒 <b>LỊCH SỬ THUÊ SỐ HÔM NAY ({today_str}):</b>\n\n"
+        for item in today_items[:15]: 
+            status_code = item.get("Status")
+            stt = "🟢 Hoàn thành" if status_code == 1 else "🟡 Đang chờ mã" if status_code == 0 else "🔴 Hết hạn"
+            msg += f"▪️ <b>{item.get('ServiceName', 'Dịch vụ')}</b> - <code>{item.get('Phone', '')}</code> ({stt})\n"
+            if status_code == 1 and item.get("Code"):
+                msg += f"   🔑 Mã: <code>{item.get('Code')}</code>\n"
+            msg += "\n"
+        
+        await update.message.reply_text(msg, parse_mode='HTML')
+
+    elif text == "🛒 Thuê số OTP":
+        await send_services_page(update.message.reply_text, 0)
+
+# --- HÀM GỬI DANH SÁCH DỊCH VỤ (INLINE KEYBOARD) ---
+async def send_services_page(reply_method, page):
+    res = await asyncio.to_thread(get_services)
+    if str(res.get("status_code")) == "200":
+        services = res["data"]
+        start_idx, end_idx = page * 10, (page * 10) + 10
+        current_services = services[start_idx:end_idx]
+        
+        keyboard = []
+        for s in current_services:
+            price_str = format_money(s['price'])
+            btn_text = f"Thuê {s['name']} ({price_str})"
+            keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"rent_{s['id']}_{s['price']}_{s['name'][:15]}")])
+        
+        nav_buttons = []
+        if page > 0: nav_buttons.append(InlineKeyboardButton("⬅️ Trước", callback_data=f"menu_services_{page-1}"))
+        if end_idx < len(services): nav_buttons.append(InlineKeyboardButton("Sau ➡️", callback_data=f"menu_services_{page+1}"))
+        if nav_buttons: keyboard.append(nav_buttons)
+        
+        keyboard.append([InlineKeyboardButton("❌ Đóng Danh Sách", callback_data="close_menu")])
+        
+        await reply_method(f"🛒 <b>Chọn Dịch Vụ (Trang {page + 1})</b>", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    else:
+        await reply_method(f"❌ Lỗi lấy dịch vụ: {res.get('message')}")
+
+# --- XỬ LÝ NÚT BẤM (INLINE BUTTONS) ---
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await query.answer("⛔ Bạn không có quyền thao tác!", show_alert=True)
+        return
+
+    await query.answer()
+    data = query.data
+
+    if data == "close_menu":
+        await query.message.delete()
+        return
+
+    if data.startswith("menu_services_"):
+        page = int(data.split("_")[2])
+        await send_services_page(query.edit_message_text, page)
+
+    elif data.startswith("rent_"):
+        parts = data.split("_")
+        service_id = parts[1]
+        raw_price = parts[2]
+        formatted_price = format_money(raw_price)
+        service_name = "_".join(parts[3:]) 
+        
+        # Bắt đầu luồng lọc thay vì request trực tiếp
+        msg_wait = await query.edit_message_text(f"⏳ Bắt đầu tiến trình tự động lọc số cho <b>{service_name}</b>...", parse_mode='HTML')
+        
+        asyncio.create_task(
+            auto_filter_and_register(service_id, service_name, raw_price, formatted_price, user_id, context, msg_wait)
+        )
+
+def main():
+    if not ADMIN_IDS:
+        print("LỖI: Chưa cấu hình danh sách ADMIN_IDS trong biến môi trường!")
+        return
+        
+    threading.Thread(target=run_web, daemon=True).start()
+        
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_menu))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    
+    print(f"🤖 Bot đang chạy! Nhận lệnh từ {len(ADMIN_IDS)} Admin...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
