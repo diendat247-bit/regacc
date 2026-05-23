@@ -4,4 +4,6 @@ apt-get update && apt-get install -y libnss3 libnspr4 libatk-1.0-0 libatk-bridge
 
 # Cài đặt Python package và trình duyệt
 pip install -r requirements.txt
-playwright install chromium
+
+# Đổi lệnh gọi Playwright qua module Python
+python -m playwright install chromium
